@@ -13,7 +13,7 @@ pi install git:github.com/Skjz/pi-train
 本地路径：
 
 ```bash
-pi install /Users/lixiang/fromGit/pi-train
+pi install /path/to/pi-train
 ```
 
 重启 Pi，或新开一个 session。
