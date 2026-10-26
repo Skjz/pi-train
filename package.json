@@ -1,0 +1,17 @@
+{
+  "name": "pi-train",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: intercept each assistant turn, let a human accept or rewrite it, export SFT/preference/trajectory JSONL.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/train-capture/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
