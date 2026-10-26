@@ -26,6 +26,7 @@ const CUSTOM_TYPE = "train-capture";
 
 const ACCEPT = "放行";
 const EDIT = "改写正文";
+const EDIT_TOOLS = "改工具参数";
 const DROP_TOOLS = "丢掉工具";
 const ABORT = "中止本轮";
 const KEEP_TOOLS = "保留工具调用";
@@ -51,6 +52,7 @@ interface EditMeta {
 	changed: boolean;
 	dismissed?: boolean;
 	keep_tools?: boolean;
+	tools_edited?: boolean;
 }
 
 interface EpisodeHeader {
@@ -134,12 +136,87 @@ function setText(message: AssistantMessage, text: string): AssistantMessage {
 }
 
 function dropToolCalls(message: AssistantMessage): AssistantMessage {
+	return setToolCalls(message, []);
+}
+
+function toolsToJson(tools: ToolCall[]): string {
+	return JSON.stringify(
+		tools.map((call) => ({
+			id: call.id,
+			name: call.name,
+			arguments: call.arguments ?? {},
+		})),
+		null,
+		2,
+	);
+}
+
+function parseToolsJson(raw: string): ToolCall[] | undefined {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!Array.isArray(parsed)) {
+			return undefined;
+		}
+		const out: ToolCall[] = [];
+		for (const item of parsed) {
+			if (!item || typeof item !== "object" || Array.isArray(item)) {
+				return undefined;
+			}
+			const rec = item as Record<string, unknown>;
+			if (typeof rec.name !== "string" || rec.name.trim() === "") {
+				return undefined;
+			}
+			const args = rec.arguments;
+			if (args === undefined || args === null || typeof args !== "object" || Array.isArray(args)) {
+				return undefined;
+			}
+			const id =
+				typeof rec.id === "string" && rec.id.trim() !== ""
+					? rec.id
+					: `train-${Math.random().toString(16).slice(2, 10)}`;
+			out.push({
+				type: "toolCall",
+				id,
+				name: rec.name,
+				arguments: args as Record<string, unknown>,
+			});
+		}
+		return out;
+	} catch {
+		return undefined;
+	}
+}
+
+function setToolCalls(message: AssistantMessage, tools: ToolCall[]): AssistantMessage {
 	const next = cloneAssistant(message);
-	next.content = next.content.filter((block) => block.type !== "toolCall");
-	if (next.stopReason === "toolUse") {
-		next.stopReason = "stop";
+	const thinking = next.content.filter((block): block is ThinkingContent => block.type === "thinking");
+	const text = next.content.filter((block): block is TextContent => block.type === "text");
+	next.content = [...thinking, ...text, ...tools];
+	if (tools.length === 0) {
+		if (next.stopReason === "toolUse") {
+			next.stopReason = "stop";
+		}
+	} else {
+		next.stopReason = "toolUse";
 	}
 	return next;
+}
+
+async function editToolCallsFromUi(
+	ctx: ExtensionContext,
+	message: AssistantMessage,
+): Promise<{ message: AssistantMessage; edited: boolean; dismissed: boolean }> {
+	const current = toolCallsOf(message);
+	const edited = await ctx.ui.editor("改工具参数（JSON：id / name / arguments）", toolsToJson(current));
+	if (edited === undefined) {
+		return { message, edited: false, dismissed: true };
+	}
+	const parsed = parseToolsJson(edited);
+	if (!parsed) {
+		ctx.ui.notify("工具 JSON 无效，已保留原来的 tool call", "warning");
+		return { message, edited: false, dismissed: false };
+	}
+	return { message: setToolCalls(message, parsed), edited: true, dismissed: false };
 }
 
 function userText(content: UserMessage["content"]): string {
@@ -517,11 +594,12 @@ export default function (pi: ExtensionAPI): void {
 		let action: EditAction = "accept";
 		let dismissed = false;
 		let keepTools: boolean | undefined;
+		let toolsEdited = false;
 
 		if (!ctx.hasUI) {
 			action = "accept";
 		} else {
-			const options = hasTools ? [ACCEPT, EDIT, DROP_TOOLS, ABORT] : [ACCEPT, EDIT, ABORT];
+			const options = hasTools ? [ACCEPT, EDIT, EDIT_TOOLS, DROP_TOOLS, ABORT] : [ACCEPT, EDIT, ABORT];
 			const preview = (textOf(draft).trim() || JSON.stringify(toolCallsOf(draft).map((call) => call.name))).slice(
 				0,
 				180,
@@ -530,21 +608,38 @@ export default function (pi: ExtensionAPI): void {
 			if (!choice) {
 				action = "accept";
 				dismissed = true;
-			} else if (choice === EDIT) {
-				const edited = await ctx.ui.editor("改写 assistant 正文", textOf(draft));
-				if (edited !== undefined) {
-					finalMessage = setText(finalMessage, edited);
-					action = "rewrite";
-				} else {
-					action = "accept";
-					dismissed = true;
+			} else if (choice === EDIT || choice === EDIT_TOOLS) {
+				if (choice === EDIT) {
+					const edited = await ctx.ui.editor("改写 assistant 正文", textOf(draft));
+					if (edited !== undefined) {
+						finalMessage = setText(finalMessage, edited);
+						action = "rewrite";
+					} else {
+						dismissed = true;
+					}
 				}
 				if (toolCallsOf(finalMessage).length > 0) {
-					const toolChoice = await ctx.ui.select("工具调用", [KEEP_TOOLS, DROP_TOOLS]);
+					const toolChoice =
+						choice === EDIT_TOOLS
+							? EDIT_TOOLS
+							: await ctx.ui.select("工具调用", [KEEP_TOOLS, EDIT_TOOLS, DROP_TOOLS]);
 					if (toolChoice === DROP_TOOLS) {
 						finalMessage = dropToolCalls(finalMessage);
 						keepTools = false;
 						action = "rewrite";
+					} else if (toolChoice === EDIT_TOOLS) {
+						const result = await editToolCallsFromUi(ctx, finalMessage);
+						finalMessage = result.message;
+						if (result.edited) {
+							toolsEdited = true;
+							keepTools = toolCallsOf(finalMessage).length > 0;
+							action = "rewrite";
+							if (!keepTools) {
+								action = "drop_tools";
+							}
+						} else if (result.dismissed && choice === EDIT_TOOLS) {
+							dismissed = true;
+						}
 					} else {
 						keepTools = true;
 					}
@@ -583,6 +678,7 @@ export default function (pi: ExtensionAPI): void {
 				changed,
 				...(dismissed ? { dismissed: true } : {}),
 				...(keepTools === undefined ? {} : { keep_tools: keepTools }),
+				...(toolsEdited ? { tools_edited: true } : {}),
 			},
 		};
 		appendJsonl(recording.filePath, turn);

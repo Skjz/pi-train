@@ -28,10 +28,11 @@ pi install /Users/lixiang/fromGit/pi-train
 
 - 放行
 - 改写正文（只改 text；thinking 不动）
+- 改工具参数（有 tool call 时才出现；JSON 编辑 `name` / `arguments`）
 - 丢掉工具（有 tool call 时才出现）
 - 中止本轮
 
-改完后若仍有工具调用，会再问一次是否保留。
+改写正文后若仍有工具调用，会再问：保留、改参数、或丢掉。改过的参数会写进定稿，这一轮按改后的调用执行。
 
 任务做完：
 
