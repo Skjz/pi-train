@@ -25,7 +25,7 @@ pi install /path/to/pi-train
 然后照常发任务。每句回复结束后会弹出：
 
 - 放行
-- 改写正文（只改 text；thinking 不动）
+- 改写正文（只改 text；定稿用助手口吻，不要写成对模型下的指令）
 - 改工具参数（有 tool call 时才出现；JSON 编辑 `name` / `arguments`）
 - 丢掉工具（有 tool call 时才出现）
 - 中止本轮
@@ -66,7 +66,7 @@ pi install /path/to/pi-train
 ## 限制
 
 - 只在 interactive / RPC（有对话框）时拦截。print / json 模式会自动放行并打标。
-- 不改 thinking / signature。
+- 改写 / 改参数 / 丢掉工具后会去掉本轮 thinking，下一轮只看到定稿，避免模型把改写当成用户介入。
 - 嵌套工具调用（codemode 内部）不弹窗。
 - Escape 视为放行，并在记录里标 `dismissed`。
 

@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - After editing assistant text, the follow-up tool prompt is 保留 / 改参数 / 丢掉, not only keep-or-drop.
 - README local install example uses `/path/to/pi-train` instead of a machine-specific home path.
 - Repository visibility is public.
+- Rewriting text or tools now strips this turn's thinking blocks from the live message, so the next model turn treats the gold as its own assistant output.
 
 ## [0.1.0] - 2026-10-26
 

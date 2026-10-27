@@ -9,7 +9,6 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
 	AssistantMessage,
 	TextContent,
-	ThinkingContent,
 	ToolCall,
 	ToolResultMessage,
 	UserMessage,
@@ -127,11 +126,16 @@ function toolCallsOf(message: AssistantMessage): ToolCall[] {
 	return message.content.filter((block): block is ToolCall => block.type === "toolCall");
 }
 
+function stripThinking(message: AssistantMessage): AssistantMessage {
+	const next = cloneAssistant(message);
+	next.content = next.content.filter((block) => block.type !== "thinking");
+	return next;
+}
+
 function setText(message: AssistantMessage, text: string): AssistantMessage {
 	const next = cloneAssistant(message);
-	const thinking = next.content.filter((block): block is ThinkingContent => block.type === "thinking");
 	const tools = next.content.filter((block): block is ToolCall => block.type === "toolCall");
-	next.content = [...thinking, { type: "text", text }, ...tools];
+	next.content = [{ type: "text", text }, ...tools];
 	return next;
 }
 
@@ -189,9 +193,8 @@ function parseToolsJson(raw: string): ToolCall[] | undefined {
 
 function setToolCalls(message: AssistantMessage, tools: ToolCall[]): AssistantMessage {
 	const next = cloneAssistant(message);
-	const thinking = next.content.filter((block): block is ThinkingContent => block.type === "thinking");
 	const text = next.content.filter((block): block is TextContent => block.type === "text");
-	next.content = [...thinking, ...text, ...tools];
+	next.content = [...text, ...tools];
 	if (tools.length === 0) {
 		if (next.stopReason === "toolUse") {
 			next.stopReason = "stop";
@@ -699,7 +702,10 @@ export default function (pi: ExtensionAPI): void {
 		}
 
 		if (changed) {
-			return { message: finalMessage };
+			// Drop this turn's CoT so the next request sees gold as the model's own
+			// assistant output. Keeping original thinking next to rewritten text/tools
+			// makes reasoning models treat the gold as a user injection.
+			return { message: stripThinking(finalMessage) };
 		}
 		return;
 	});
