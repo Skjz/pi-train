@@ -18,7 +18,7 @@ import type {
 	ExtensionContext,
 	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 const CUSTOM_TYPE = "train-capture";
@@ -26,11 +26,19 @@ const CUSTOM_TYPE = "train-capture";
 const ACCEPT = "放行";
 const EDIT = "改写正文";
 const EDIT_TOOLS = "改工具参数";
+const EXPLAIN = "解释这次调用";
+const PROMPT = "提示生成";
 const DROP_TOOLS = "丢掉工具";
 const ABORT = "中止本轮";
 const KEEP_TOOLS = "保留工具调用";
+const PROMPT_CUSTOM_TYPE = "train-prompt";
+const EXPLAIN_SYSTEM = [
+	"你在帮训练员阅读一条即将执行、但还没有执行的 assistant 工具调用。",
+	"用中文、短句说明：每个调用做什么、关键参数（路径、命令、查询）是什么、有没有明显风险（删文件、覆盖、联网、长时间运行）。",
+	"不要改写调用，不要建议下一步，不要复述完整参数。",
+].join("");
 
-type EditAction = "accept" | "rewrite" | "drop_tools" | "abort";
+type EditAction = "accept" | "rewrite" | "drop_tools" | "abort" | "prompt_pending" | "prompt_rewrite";
 
 interface TrainToolCall {
 	id: string;
@@ -52,6 +60,8 @@ interface EditMeta {
 	dismissed?: boolean;
 	keep_tools?: boolean;
 	tools_edited?: boolean;
+	prompt?: string;
+	skip_export?: boolean;
 }
 
 interface EpisodeHeader {
@@ -97,6 +107,15 @@ interface SlimEntry {
 	changed?: boolean;
 	success?: boolean | null;
 	note?: string;
+	skip_in_context?: boolean;
+	assistant_timestamp?: number;
+}
+
+interface PendingPrompt {
+	hint: string;
+	context: TrainChatMessage[];
+	draft: TrainChatMessage;
+	waiting: boolean;
 }
 
 interface Recording {
@@ -152,6 +171,122 @@ function toolsToJson(tools: ToolCall[]): string {
 		})),
 		null,
 		2,
+	);
+}
+
+function clipText(value: string, max: number): string {
+	if (value.length <= max) {
+		return value;
+	}
+	return `${value.slice(0, max)}\n…(截断 ${value.length - max} 字)`;
+}
+
+function clipOneLine(value: string, max: number): string {
+	const compact = value.replace(/\s+/g, " ").trim();
+	if (compact.length <= max) {
+		return compact;
+	}
+	return `${compact.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function summarizeToolCall(call: ToolCall): string {
+	const args = call.arguments ?? {};
+	const keys = [
+		"command",
+		"cmd",
+		"path",
+		"file_path",
+		"filePath",
+		"pattern",
+		"query",
+		"url",
+		"script",
+		"oldText",
+		"newText",
+		"content",
+	];
+	for (const key of keys) {
+		const value = args[key];
+		if (typeof value === "string" && value.trim()) {
+			return `${call.name}: ${clipOneLine(value, 70)}`;
+		}
+	}
+	return call.name;
+}
+
+function previewTurn(message: AssistantMessage): string {
+	const tools = toolCallsOf(message);
+	if (tools.length > 0) {
+		return tools.map(summarizeToolCall).join(" · ");
+	}
+	return textOf(message).trim();
+}
+
+async function explainToolCallsFromUi(ctx: ExtensionContext, message: AssistantMessage): Promise<void> {
+	const dump = toolsToJson(toolCallsOf(message));
+	const body = textOf(message).trim();
+	const model = ctx.model;
+	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+		await ctx.ui.editor("这次工具调用（当前模型不可用，只显示原文。Escape 返回）", dump);
+		return;
+	}
+
+	const userText = [
+		body ? `助手正文：\n${clipText(body, 4000)}` : "",
+		`工具调用 JSON：\n${clipText(dump, 12000)}`,
+	]
+		.filter(Boolean)
+		.join("\n\n");
+
+	const run = async (signal?: AbortSignal): Promise<string> => {
+		const response = await ctx.modelRegistry.complete(
+			model,
+			{
+				systemPrompt: EXPLAIN_SYSTEM,
+				messages: [
+					{
+						role: "user",
+						content: [{ type: "text", text: userText }],
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{ signal },
+		);
+		if (response.stopReason === "aborted") {
+			return "";
+		}
+		if (response.stopReason === "error") {
+			return `解释失败：${response.errorMessage ?? "unknown error"}`;
+		}
+		return textOf(response);
+	};
+
+	let explanation = "";
+	if (ctx.mode === "tui") {
+		explanation =
+			(await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+				const loader = new BorderedLoader(tui, theme, `正在解释工具调用（${model.id}）…`);
+				loader.onAbort = () => done(null);
+				run(loader.signal)
+					.then((text) => done(text))
+					.catch((error) =>
+						done(`解释失败：${error instanceof Error ? error.message : String(error)}`),
+					);
+				return loader;
+			})) ?? "";
+	} else {
+		ctx.ui.notify("正在解释这次工具调用…", "info");
+		try {
+			explanation = await run();
+		} catch (error) {
+			explanation = `解释失败：${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+
+	await ctx.ui.editor(
+		"这次工具调用在做什么（Escape 返回菜单）",
+		[explanation.trim() || "（没有生成解释）", "", "—— 调用原文 ——", dump].join("\n"),
 	);
 }
 
@@ -271,18 +406,46 @@ function serializeAgentMessage(message: AgentMessage): TrainChatMessage | undefi
 	return undefined;
 }
 
-function snapshotContext(branch: SessionEntry[]): TrainChatMessage[] {
+function snapshotContext(
+	branch: SessionEntry[],
+	hidden: ReadonlySet<number> = new Set(),
+): TrainChatMessage[] {
 	const out: TrainChatMessage[] = [];
 	for (const entry of branch) {
 		if (entry.type !== "message") {
 			continue;
 		}
-		const serialized = serializeAgentMessage(entry.message);
+		const message = entry.message;
+		if (isAssistantMessage(message) && hidden.has(message.timestamp)) {
+			continue;
+		}
+		const serialized = serializeAgentMessage(message);
 		if (serialized) {
 			out.push(serialized);
 		}
 	}
 	return out;
+}
+
+function isTrainPromptMessage(message: AgentMessage): boolean {
+	return (
+		typeof message === "object" &&
+		message !== null &&
+		"role" in message &&
+		(message as { role: string }).role === "custom" &&
+		(message as { customType?: string }).customType === PROMPT_CUSTOM_TYPE
+	);
+}
+
+function buildRegenPrompt(hint: string): string {
+	return [
+		"[train-capture] 按训练员提示重新生成当前这一轮 assistant 回复。",
+		"前面的 assistant 草稿已经作废，不要解释这次改写，不要复述提示词。",
+		"直接给出这一轮的正文，以及需要的 tool call。",
+		"",
+		"训练员提示：",
+		hint,
+	].join("\n");
 }
 
 function sameAssistant(a: TrainChatMessage, b: TrainChatMessage): boolean {
@@ -332,6 +495,8 @@ export default function (pi: ExtensionAPI): void {
 	let recording: Recording | undefined;
 	let lastEnded: Recording | undefined;
 	let blockTools = false;
+	let pendingPrompt: PendingPrompt | undefined;
+	const hiddenTimestamps = new Set<number>();
 
 	pi.registerFlag("train", {
 		description: "Start the session in training capture mode",
@@ -419,6 +584,8 @@ export default function (pi: ExtensionAPI): void {
 		lastEnded = ended;
 		recording = undefined;
 		blockTools = false;
+		pendingPrompt = undefined;
+		hiddenTimestamps.clear();
 		updateUi(ctx);
 		return ended;
 	}
@@ -426,6 +593,8 @@ export default function (pi: ExtensionAPI): void {
 	function restoreFromSession(ctx: ExtensionContext): void {
 		recording = undefined;
 		blockTools = false;
+		pendingPrompt = undefined;
+		hiddenTimestamps.clear();
 		let restored: Recording | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== CUSTOM_TYPE) {
@@ -448,8 +617,12 @@ export default function (pi: ExtensionAPI): void {
 				if (data.changed) {
 					restored.rewrites += 1;
 				}
+				if (data.skip_in_context && data.assistant_timestamp) {
+					hiddenTimestamps.add(data.assistant_timestamp);
+				}
 			} else if (data.kind === "episode_end" && restored && data.episode_id === restored.episodeId) {
 				restored = undefined;
+				hiddenTimestamps.clear();
 			}
 		}
 		recording = restored;
@@ -460,7 +633,9 @@ export default function (pi: ExtensionAPI): void {
 		const records = readJsonl(filePath);
 		const header = records.find((row): row is EpisodeHeader => row.type === "episode");
 		const end = [...records].reverse().find((row): row is EpisodeEnd => row.type === "episode_end");
-		const turns = records.filter((row): row is TurnRecord => row.type === "turn");
+		const turns = records.filter(
+			(row): row is TurnRecord => row.type === "turn" && !row.edit.skip_export,
+		);
 		mkdirSync(outDir, { recursive: true });
 
 		const sftLines: string[] = [];
@@ -532,7 +707,13 @@ export default function (pi: ExtensionAPI): void {
 		if (data.kind === "episode_start") {
 			label = `TRAIN 开始 · ${data.task ?? ""}`;
 		} else if (data.kind === "turn") {
-			const mark = data.changed ? data.action ?? "rewrite" : "accept";
+			const mark = data.changed
+				? data.action === "prompt_pending"
+					? "提示生成"
+					: data.action === "prompt_rewrite"
+						? "提示改写"
+						: (data.action ?? "rewrite")
+				: "accept";
 			label = `TRAIN t${data.turn ?? "?"} · ${mark}`;
 		} else if (data.kind === "episode_end") {
 			const result = data.success === true ? "success" : data.success === false ? "fail" : "stop";
@@ -540,6 +721,19 @@ export default function (pi: ExtensionAPI): void {
 		}
 		const box = new Box(0, 0);
 		box.addChild(new Text(theme.fg("dim", label), 0, 0));
+		return box;
+	});
+
+	pi.registerMessageRenderer<{ hint?: string }>(PROMPT_CUSTOM_TYPE, (message, _options, theme) => {
+		const hint =
+			typeof message.details?.hint === "string"
+				? message.details.hint
+				: typeof message.content === "string"
+					? message.content
+					: "";
+		const preview = hint.trim().replace(/\s+/g, " ").slice(0, 80);
+		const box = new Box(0, 0);
+		box.addChild(new Text(theme.fg("warning", `TRAIN 提示生成${preview ? ` · ${preview}` : ""}`), 0, 0));
 		return box;
 	});
 
@@ -557,8 +751,55 @@ export default function (pi: ExtensionAPI): void {
 		updateUi(ctx);
 	});
 
-	pi.on("turn_end", () => {
+	pi.on("context", (event) => {
+		if (!recording && hiddenTimestamps.size === 0) {
+			return;
+		}
+		const messages = event.messages;
+		let lastPrompt = -1;
+		if (pendingPrompt?.waiting) {
+			for (let i = 0; i < messages.length; i++) {
+				const candidate = messages[i];
+				if (candidate && isTrainPromptMessage(candidate)) {
+					lastPrompt = i;
+				}
+			}
+		}
+		const filtered = messages.filter((message, index) => {
+			if (isTrainPromptMessage(message)) {
+				return index === lastPrompt;
+			}
+			if (isAssistantMessage(message) && hiddenTimestamps.has(message.timestamp)) {
+				return false;
+			}
+			return true;
+		});
+		if (filtered.length === messages.length) {
+			return;
+		}
+		return { messages: filtered };
+	});
+
+	pi.on("turn_end", (_event, ctx) => {
 		blockTools = false;
+		if (!recording || !pendingPrompt?.waiting) {
+			return;
+		}
+		if (ctx.hasUI) {
+			ctx.ui.notify("已按提示重新生成这一轮，请等下一句再审。", "info");
+		}
+		return {
+			entries: [
+				{
+					type: "custom_message" as const,
+					customType: PROMPT_CUSTOM_TYPE,
+					content: buildRegenPrompt(pendingPrompt.hint),
+					display: true,
+					details: { hint: pendingPrompt.hint },
+				},
+			],
+			continue: true,
+		};
 	});
 
 	pi.on("tool_call", (event) => {
@@ -591,32 +832,64 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 
+		const stitching = pendingPrompt;
+		if (pendingPrompt) {
+			pendingPrompt.waiting = false;
+		}
+
 		const draft = cloneAssistant(event.message);
-		const agentSnapshot = serializeAssistant(draft);
+		const agentSnapshot = stitching ? stitching.draft : serializeAssistant(draft);
 		let finalMessage = cloneAssistant(draft);
-		let action: EditAction = "accept";
+		let action: EditAction = stitching ? "prompt_rewrite" : "accept";
 		let dismissed = false;
 		let keepTools: boolean | undefined;
 		let toolsEdited = false;
 
 		if (!ctx.hasUI) {
-			action = "accept";
+			action = stitching ? "prompt_rewrite" : "accept";
 		} else {
-			const options = hasTools ? [ACCEPT, EDIT, EDIT_TOOLS, DROP_TOOLS, ABORT] : [ACCEPT, EDIT, ABORT];
-			const preview = (textOf(draft).trim() || JSON.stringify(toolCallsOf(draft).map((call) => call.name))).slice(
-				0,
-				180,
-			);
-			const choice = await ctx.ui.select(`TRAIN t${recording.turn + 1}  ${preview}`, options);
+			const options = hasTools
+				? [ACCEPT, EXPLAIN, EDIT, EDIT_TOOLS, PROMPT, DROP_TOOLS, ABORT]
+				: [ACCEPT, EDIT, PROMPT, ABORT];
+			let choice: string | undefined;
+			while (true) {
+				const preview = previewTurn(draft).slice(0, 180);
+				choice = await ctx.ui.select(`TRAIN t${recording.turn + 1}  ${preview}`, options);
+				if (choice === EXPLAIN) {
+					await explainToolCallsFromUi(ctx, draft);
+					continue;
+				}
+				break;
+			}
 			if (!choice) {
-				action = "accept";
+				action = stitching ? "prompt_rewrite" : "accept";
 				dismissed = true;
+			} else if (choice === PROMPT) {
+				const hint = await ctx.ui.editor(
+					"提示生成：写下这一轮该怎么走（模型按原上下文重新生成，可带 tool call）",
+					stitching?.hint ?? "",
+				);
+				if (hint === undefined || hint.trim() === "") {
+					dismissed = true;
+					action = stitching ? "prompt_rewrite" : "accept";
+				} else {
+					hiddenTimestamps.add(event.message.timestamp);
+					pendingPrompt = {
+						hint: hint.trim(),
+						context: stitching?.context ?? snapshotContext(ctx.sessionManager.getBranch(), hiddenTimestamps),
+						draft: stitching?.draft ?? agentSnapshot,
+						waiting: true,
+					};
+					finalMessage = dropToolCalls(finalMessage);
+					action = "prompt_pending";
+					keepTools = false;
+				}
 			} else if (choice === EDIT || choice === EDIT_TOOLS) {
 				if (choice === EDIT) {
 					const edited = await ctx.ui.editor("改写 assistant 正文", textOf(draft));
 					if (edited !== undefined) {
 						finalMessage = setText(finalMessage, edited);
-						action = "rewrite";
+						action = stitching ? "prompt_rewrite" : "rewrite";
 					} else {
 						dismissed = true;
 					}
@@ -629,14 +902,14 @@ export default function (pi: ExtensionAPI): void {
 					if (toolChoice === DROP_TOOLS) {
 						finalMessage = dropToolCalls(finalMessage);
 						keepTools = false;
-						action = "rewrite";
+						action = stitching ? "prompt_rewrite" : "rewrite";
 					} else if (toolChoice === EDIT_TOOLS) {
 						const result = await editToolCallsFromUi(ctx, finalMessage);
 						finalMessage = result.message;
 						if (result.edited) {
 							toolsEdited = true;
 							keepTools = toolCallsOf(finalMessage).length > 0;
-							action = "rewrite";
+							action = stitching ? "prompt_rewrite" : "rewrite";
 							if (!keepTools) {
 								action = "drop_tools";
 							}
@@ -656,24 +929,25 @@ export default function (pi: ExtensionAPI): void {
 				action = "abort";
 				keepTools = false;
 			} else {
-				action = "accept";
+				action = stitching ? "prompt_rewrite" : "accept";
 			}
 		}
 
 		const humanSnapshot = serializeAssistant(finalMessage);
-		const changed = !sameAssistant(agentSnapshot, humanSnapshot);
+		const changed = action === "prompt_pending" || !sameAssistant(agentSnapshot, humanSnapshot);
 		recording.turn += 1;
 		if (changed) {
 			recording.rewrites += 1;
 		}
 
+		const promptHint = action === "prompt_pending" ? pendingPrompt?.hint : stitching?.hint;
 		const turn: TurnRecord = {
 			type: "turn",
 			episode_id: recording.episodeId,
 			turn: recording.turn,
 			task: recording.task,
 			timestamp: new Date().toISOString(),
-			context: snapshotContext(ctx.sessionManager.getBranch()),
+			context: stitching?.context ?? snapshotContext(ctx.sessionManager.getBranch(), hiddenTimestamps),
 			agent_draft: agentSnapshot,
 			human_final: humanSnapshot,
 			edit: {
@@ -682,6 +956,8 @@ export default function (pi: ExtensionAPI): void {
 				...(dismissed ? { dismissed: true } : {}),
 				...(keepTools === undefined ? {} : { keep_tools: keepTools }),
 				...(toolsEdited ? { tools_edited: true } : {}),
+				...(promptHint ? { prompt: promptHint } : {}),
+				...(action === "prompt_pending" ? { skip_export: true } : {}),
 			},
 		};
 		appendJsonl(recording.filePath, turn);
@@ -691,8 +967,15 @@ export default function (pi: ExtensionAPI): void {
 			turn: recording.turn,
 			action,
 			changed,
+			...(action === "prompt_pending"
+				? { skip_in_context: true, assistant_timestamp: event.message.timestamp }
+				: {}),
 		});
 		updateUi(ctx);
+
+		if (action !== "prompt_pending") {
+			pendingPrompt = undefined;
+		}
 
 		if (action === "drop_tools" || action === "abort") {
 			blockTools = true;

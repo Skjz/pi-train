@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repository at `https://github.com/Skjz/pi-train`, installable with `pi install git:github.com/Skjz/pi-train`.
 - MIT license.
 - Rewrite flow can edit tool-call `name` and `arguments` as JSON (`改工具参数`). Changed calls run this turn and are stored as `human_final`.
+- Intercept option `提示生成`: write a short hint and the agent regenerates this turn (text and tool calls) from the original context. Manual rewrite stays available. Export stitches original context plus the regenerated gold and omits the hint.
+- Intercept option `解释这次调用`: the current model explains pending tool calls off-session (not exported). The dialog also shows pretty-printed call JSON. Select preview shows tool name plus a short argument snippet.
 
 ### Changed
 
