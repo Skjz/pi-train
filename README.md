@@ -4,8 +4,6 @@
 
 ## 安装
 
-私有仓库（本机已登录 `gh` / git 凭据即可）：
-
 ```bash
 pi install git:github.com/Skjz/pi-train
 ```
@@ -71,3 +69,7 @@ pi install /path/to/pi-train
 - 不改 thinking / signature。
 - 嵌套工具调用（codemode 内部）不弹窗。
 - Escape 视为放行，并在记录里标 `dismissed`。
+
+## 许可
+
+[MIT](LICENSE)

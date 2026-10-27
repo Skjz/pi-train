@@ -9,13 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Private GitHub repository at `https://github.com/Skjz/pi-train`, installable with `pi install git:github.com/Skjz/pi-train`.
+- GitHub repository at `https://github.com/Skjz/pi-train`, installable with `pi install git:github.com/Skjz/pi-train`.
+- MIT license.
 - Rewrite flow can edit tool-call `name` and `arguments` as JSON (`改工具参数`). Changed calls run this turn and are stored as `human_final`.
 
 ### Changed
 
 - After editing assistant text, the follow-up tool prompt is 保留 / 改参数 / 丢掉, not only keep-or-drop.
 - README local install example uses `/path/to/pi-train` instead of a machine-specific home path.
+- Repository visibility is public.
 
 ## [0.1.0] - 2026-10-26
 

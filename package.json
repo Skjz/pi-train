@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "Pi extension: intercept each assistant turn, let a human accept or rewrite it, export SFT/preference/trajectory JSONL.",
   "keywords": ["pi-package"],
   "pi": {
